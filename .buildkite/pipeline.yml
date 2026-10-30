@@ -1,0 +1,33 @@
+steps:
+  - label: "🔍 Lint"
+    priority: 80
+    key: lint
+    commands:
+      - .buildkite/run-in-docker.sh .buildkite/lint.sh
+    agents:
+      queue: "high-concurrency"
+
+  - label: "✅ Test"
+    priority: 80
+    key: test
+    commands:
+      - .buildkite/run-in-docker.sh .buildkite/test.sh
+    agents:
+      queue: "high-concurrency"
+
+  - label: "🔨 Build"
+    priority: 70
+    key: build
+    commands:
+      - .buildkite/run-in-docker.sh .buildkite/build.sh
+    artifact_paths:
+      - "builds/*.tar.gz"
+    agents:
+      queue: "high-concurrency"
+
+  - label: "☁️ Upload"
+    priority: 50
+    key: upload
+    commands:
+      - .buildkite/upload.sh
+    depends_on: [test, build]

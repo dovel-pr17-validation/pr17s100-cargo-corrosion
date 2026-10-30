@@ -1,0 +1,11 @@
+[package]
+name = "backoff"
+version = "0.1.0"
+authors = ["Jerome Gravel-Niquet <jeromegn@gmail.com>"]
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+rand = { workspace = true }

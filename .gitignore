@@ -1,0 +1,10 @@
+/target
+/schema
+/config.toml
+/data
+/book
+.direnv/**
+*.log
+.antithesis/config/volumes
+benchmark_results/*
+.DS_Store

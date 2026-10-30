@@ -1,0 +1,1058 @@
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use admin::AdminConn;
+// use antithesis_sdk::assert_sometimes;
+use camino::Utf8PathBuf;
+use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
+use command::{
+    tls::{generate_ca, generate_client_cert, generate_server_cert},
+    tpl::TemplateFlags,
+};
+use corro_admin::TracingHandle;
+use corro_api_types::SqliteParam;
+use corro_client::CorrosionApiClient;
+use corro_types::{
+    actor::{ActorId, ClusterId},
+    api::{ExecResult, QueryEvent, Statement},
+    base::{CrsqlDbVersion, CrsqlSeq},
+    broadcast::{ChangeV1, Changeset, Timestamp},
+    change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    config::{default_admin_path, AuthzConfig, Config, ConfigError, LogFormat, OtelConfig},
+    sqlite::CrConn,
+};
+use futures::StreamExt;
+use once_cell::sync::OnceCell;
+use opentelemetry::{global, KeyValue};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk as os;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use speedy::Writable;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{
+    fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
+    EnvFilter,
+};
+use uuid::Uuid;
+
+pub mod admin;
+pub mod command;
+
+pub const VERSION: &str = env!("CORRO_VERSION");
+pub const GIT_SHA: &str = env!("CORRO_GIT_SHA");
+
+pub static CONFIG: OnceCell<Config> = OnceCell::new();
+pub static API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
+
+build_info::build_info!(pub fn version);
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn init_tracing(cli: &Cli, command: &Command) -> Result<Option<TracingHandle>, ConfigError> {
+    let mut tracing_handle = None;
+    if matches!(command, Command::Agent) {
+        let config = cli.config()?;
+
+        let directives: String = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+        let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
+        if let Some(diags) = diags {
+            eprintln!("While parsing env filters: {diags}, using default");
+        }
+
+        global::set_text_map_propagator(os::propagation::TraceContextPropagator::new());
+
+        // Tracing
+        let (env_filter, handle) = tracing_subscriber::reload::Layer::new(filter.layer());
+        tracing_handle = Some(handle);
+        let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
+
+        if let Some(otel) = &config.telemetry.open_telemetry {
+            let otlp_exporter = opentelemetry_otlp::SpanExporter::builder().with_tonic();
+            let otlp_exporter = match otel {
+                OtelConfig::FromEnv => otlp_exporter,
+                OtelConfig::Exporter { endpoint } => otlp_exporter.with_endpoint(endpoint),
+            }
+            .build()
+            .map_err(|err| config::ConfigError::Foreign(Box::new(err)))?;
+
+            let trace_config = os::Resource::builder()
+                .with_attribute(KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                    "corrosion",
+                ))
+                .with_attribute(KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                    VERSION,
+                ))
+                .with_attribute(KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::HOST_NAME,
+                    hostname::get().unwrap().to_string_lossy().into_owned(),
+                ))
+                .build();
+
+            let batch_processor =
+                os::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(
+                    otlp_exporter,
+                    os::runtime::Tokio,
+                )
+                .with_batch_config(
+                    os::trace::BatchConfigBuilder::default()
+                        .with_max_queue_size(10240)
+                        .build(),
+                )
+                .build();
+
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_resource(trace_config)
+                .with_span_processor(batch_processor)
+                .build();
+
+            use opentelemetry::trace::TracerProvider;
+            let tracer = provider.tracer("");
+            global::set_tracer_provider(provider);
+
+            let sub = sub.with(tracing_opentelemetry::layer().with_tracer(tracer));
+            match config.log.format {
+                LogFormat::Plaintext => {
+                    sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
+                        .init();
+                }
+                LogFormat::Json => {
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .json()
+                            .with_span_list(false),
+                    )
+                    .init();
+                }
+            }
+        } else {
+            match config.log.format {
+                LogFormat::Plaintext => {
+                    sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
+                        .init();
+                }
+                LogFormat::Json => {
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .json()
+                            .with_span_list(false),
+                    )
+                    .init();
+                }
+            }
+        }
+    } else {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().event_format(Format::default().without_time()))
+            .with(
+                EnvFilter::try_from_default_env()
+                    .or_else(|_| EnvFilter::try_new("info"))
+                    .unwrap(),
+            )
+            .init();
+    }
+
+    Ok(tracing_handle)
+}
+
+async fn vacuum_into(db_path: &Path, destination: &str) -> eyre::Result<PathBuf> {
+    let destination_path = PathBuf::from(destination);
+
+    if let Some(parent) = destination_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute("VACUUM INTO ?;", [destination])?;
+
+    Ok(destination_path)
+}
+
+async fn process_cli(mut cli: Cli) -> eyre::Result<()> {
+    let command = cli.command.take().expect("command validated in main");
+    let tracing_handle = init_tracing(&cli, &command)?;
+
+    match &command {
+        // handled in main() before the tokio runtime is built
+        Command::Version => unreachable!(),
+        Command::Agent => {
+            command::agent::run(cli.config()?, &cli.config_path, tracing_handle).await?
+        }
+
+        Command::Backup { path } => {
+            // assert_sometimes!(true, "Corrosion database is backed up");
+            let db_path = cli.db_path()?;
+            let backup_path = vacuum_into(db_path.as_std_path(), path).await?;
+
+            {
+                // crsqlite connection here cause crsql_site_id table has a trigger
+                // that calls a crsqlite function.
+                let conn = CrConn::init(Connection::open(&backup_path)?)?;
+
+                let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+
+                let site_id: Option<[u8; 16]> = conn
+                    .query_row(
+                        "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+
+                match site_id {
+                    Some(site_id) => {
+                        let new_ordinal: i64 = conn.query_row(
+                            "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
+                            [&site_id],
+                            |row| row.get(0),
+                        )?;
+
+                        for table in tables {
+                            let n = conn.execute(
+                                &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id = 0"),
+                                [new_ordinal],
+                            )?;
+                            debug!("updated {n} rows in {table}");
+                        }
+                    }
+                    None => {
+                        // check if any tables have rows with site_id = 0 and return an error
+                        for table in tables {
+                            let exists = conn.query_row(
+                                &format!(
+                                    "SELECT EXISTS (SELECT 1 FROM \"{table}\" WHERE site_id = 0)"
+                                ),
+                                [],
+                                |row| row.get::<_, bool>(0),
+                            )?;
+                            if exists {
+                                eyre::bail!("Site id missing (but has rows in table: {table})");
+                            }
+                        }
+                    }
+                }
+
+                // clear __corro_members, this state is per actor
+                conn.execute("DELETE FROM __corro_members;", [])?;
+
+                // clear __corro_subs, this state is per actor
+                if let Err(e) = conn.execute("DELETE FROM __corro_subs;", []) {
+                    warn!(error = %e,
+                        "could not clear __corro_subs table, possibly because it was never created"
+                    );
+                }
+
+                if let Err(e) = conn.execute_batch(
+                    "DROP TABLE __corro_consul_services; DROP TABLE __corro_consul_checks;",
+                ) {
+                    warn!(error = %e, "could not drop consul services and checks hash tables, probably because they were never created");
+                }
+
+                conn.execute_batch(
+                    r#"
+                    PRAGMA journal_mode = WAL; -- so the restore can be done online
+                    PRAGMA wal_checkpoint(TRUNCATE);
+                    "#,
+                )?;
+            }
+
+            info!("Successfully cleaned for restoration and backed up database to {path}");
+        }
+        Command::Restore {
+            path,
+            self_actor_id,
+            actor_id,
+        } => {
+            if AdminConn::connect(cli.admin_path()).await.is_ok() {
+                eyre::bail!("corrosion is currently running, shut it down before restoring!");
+            }
+
+            // assert_sometimes!(true, "Corrosion restores database from backup");
+            let config = match cli.config() {
+                Ok(config) => config,
+                Err(_e) => {
+                    eyre::bail!(
+                        "path to current database is required via the config file passed as --config"
+                    );
+                }
+            };
+
+            let db_path = &config.db.path;
+
+            if *self_actor_id || actor_id.is_some() {
+                let site_id: Uuid = {
+                    if let Some(actor_id) = actor_id {
+                        *actor_id
+                    } else {
+                        let conn = Connection::open(db_path)?;
+                        conn.query_row(
+                            "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
+                            [],
+                            |row| row.get(0),
+                        )?
+                    }
+                };
+
+                let conn = Connection::open(path)?;
+
+                let ordinal: Option<i64> = conn
+                    .query_row(
+                        "DELETE FROM crsql_site_id WHERE site_id = ? RETURNING ordinal",
+                        [site_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if ordinal.is_none() {
+                    warn!("snapshot database did not know about the current actor id");
+                }
+
+                let inserted = conn.execute(
+                    "INSERT OR REPLACE INTO crsql_site_id (ordinal, site_id) VALUES (0, ?)",
+                    [site_id],
+                )?;
+                if inserted != 1 {
+                    eyre::bail!("could not insert old site id into crsql_site_id table");
+                }
+
+                if let Some(ordinal) = ordinal {
+                    if ordinal == 0 {
+                        warn!("skipping clock table site_id rewrite: ordinal was 0 and therefore did not change");
+                    } else {
+                        info!("rewriting clock tables site_id");
+                        let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+
+                        for table in tables {
+                            let n = conn.execute(
+                                &format!("UPDATE \"{table}\" SET site_id = 0 WHERE site_id = ?"),
+                                [ordinal],
+                            )?;
+                            info!("Updated {n} rows in {table}");
+                        }
+                    }
+                }
+            }
+
+            let subs_path = config.db.subscriptions_path();
+
+            info!("removing subscriptions at {subs_path}");
+            match tokio::fs::remove_dir_all(subs_path).await {
+                Ok(_) => {
+                    info!("cleared subscriptions");
+                }
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        info!("no subscriptions to delete.");
+                    }
+                    _ => {
+                        eyre::bail!(
+                            "aborting restore! could not delete previous subscriptions: {e}"
+                        )
+                    }
+                },
+            }
+
+            if path == db_path {
+                info!("reused the db path, not copying database into place");
+            } else {
+                let restored =
+                    sqlite3_restore::restore(path, cli.config()?.db.path, Duration::from_secs(30))?;
+
+                info!(
+                    "successfully restored! old size: {}, new size: {}",
+                    restored.old_len, restored.new_len
+                );
+            }
+        }
+        Command::Cluster(ClusterCommand::Rejoin) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::Rejoin,
+            ))
+            .await?;
+        }
+        Command::Cluster(ClusterCommand::Members) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::Members,
+            ))
+            .await?;
+        }
+        Command::Cluster(ClusterCommand::MembershipStates) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::MembershipStates,
+            ))
+            .await?;
+        }
+        Command::Cluster(ClusterCommand::SetId { cluster_id }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::SetId(ClusterId(*cluster_id)),
+            ))
+            .await?;
+        }
+        Command::Consul(cmd) => match cmd {
+            ConsulCommand::Sync => match cli.config()?.consul.as_ref() {
+                Some(consul) => {
+                    command::consul::sync::run(consul, cli.api_addr()?, cli.db_path()?).await?
+                }
+                None => eyre::bail!("missing `consul` block in corrosion config"),
+            },
+        },
+        Command::Query {
+            query,
+            columns: show_columns,
+            timer,
+            param,
+            timeout,
+        } => {
+            let stmt = if param.is_empty() {
+                Statement::Simple(query.clone())
+            } else {
+                Statement::WithParams(
+                    query.clone(),
+                    param.iter().map(|p| SqliteParam::Text(p.into())).collect(),
+                )
+            };
+
+            let mut query = cli.api_client()?.query(&stmt, *timeout).await?;
+            while let Some(res) = query.next().await {
+                match res {
+                    Ok(QueryEvent::Columns(cols)) => {
+                        if *show_columns {
+                            println!("{}", cols.join("|"));
+                        }
+                    }
+                    Ok(QueryEvent::Row(_, cells)) => {
+                        println!(
+                            "{}",
+                            cells
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        );
+                    }
+                    Ok(QueryEvent::EndOfQuery { time, .. }) => {
+                        if *timer {
+                            println!("time: {time}s");
+                        }
+                    }
+                    Ok(QueryEvent::Change(_, _, _, _)) => {
+                        break;
+                    }
+                    Ok(QueryEvent::Error(e)) => {
+                        eyre::bail!("{e}");
+                    }
+                    Err(e) => {
+                        eyre::bail!("{e}");
+                    }
+                }
+            }
+        }
+        Command::Exec {
+            query,
+            param,
+            timer,
+            timeout,
+        } => {
+            let stmt = if param.is_empty() {
+                Statement::Simple(query.clone())
+            } else {
+                Statement::WithParams(
+                    query.clone(),
+                    param.iter().map(|p| SqliteParam::Text(p.into())).collect(),
+                )
+            };
+
+            let res = cli.api_client()?.execute(&[stmt], *timeout).await?;
+
+            for res in res.results {
+                match res {
+                    ExecResult::Execute {
+                        rows_affected,
+                        time,
+                    } => {
+                        info!("Rows affected: {rows_affected}");
+                        if *timer {
+                            println!("Run Time: real {time}");
+                        }
+                    }
+                    ExecResult::Error { error } => {
+                        error!("{error}");
+                    }
+                }
+            }
+        }
+        Command::Reload => command::reload::run(cli.admin_path()).await?,
+        Command::ReloadDicts => command::reload::run_dicts(cli.admin_path()).await?,
+        Command::Sync(SyncCommand::Generate) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::Generate,
+            ))
+            .await?;
+        }
+        Command::Sync(SyncCommand::ReconcileGaps) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ReconcileGaps,
+            ))
+            .await?;
+        }
+        Command::Sync(SyncCommand::CheckBookieConsistency) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::CheckBookieConsistency,
+            ))
+            .await?;
+        }
+        Command::Sync(SyncCommand::ProcessBufferedChanges {
+            actor_id,
+            version,
+            chunk_size,
+        }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ProcessBufferedChanges {
+                    actor_id: ActorId(*actor_id),
+                    version: CrsqlDbVersion(*version),
+                    chunk_size: *chunk_size,
+                },
+            ))
+            .await?;
+        }
+        Command::Template { template, flags } => {
+            command::tpl::run(cli.api_addr()?, template, flags).await?;
+        }
+        Command::Tls(tls) => match tls {
+            TlsCommand::Ca(TlsCaCommand::Generate) => generate_ca(std::env::current_dir()?).await?,
+            TlsCommand::Server(TlsServerCommand::Generate {
+                ip,
+                ca_key,
+                ca_cert,
+            }) => generate_server_cert(ca_cert, ca_key, *ip).await?,
+            TlsCommand::Client(TlsClientCommand::Generate { ca_key, ca_cert }) => {
+                generate_client_cert(ca_cert, ca_key).await?
+            }
+        },
+        Command::Actor(ActorCommand::Version { actor_id, version }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Actor(
+                corro_admin::ActorCommand::Version {
+                    actor_id: ActorId(*actor_id),
+                    version: CrsqlDbVersion(*version),
+                },
+            ))
+            .await?;
+        }
+        Command::Db(DbCommand::Lock { cmd }) => {
+            let config = match cli.config() {
+                Ok(config) => config,
+                Err(_e) => {
+                    eyre::bail!(
+                        "path to current database is required via the config file passed as --config"
+                    );
+                }
+            };
+
+            let db_path = &config.db.path;
+            info!("Opening DB file at {db_path}");
+            let mut db_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(db_path)?;
+
+            info!("Acquiring lock...");
+            let start = Instant::now();
+            let _lock = sqlite3_restore::lock_all(&mut db_file, db_path, Duration::from_secs(30))?;
+            info!("Lock acquired after {:?}", start.elapsed());
+
+            info!("Launching command {cmd}");
+            let mut splitted_cmd = shell_words::split(cmd.as_str())?;
+            let exit = std::process::Command::new(splitted_cmd.remove(0))
+                .args(splitted_cmd)
+                .spawn()?
+                .wait()?;
+
+            info!("Exited with code: {:?}", exit.code());
+            std::process::exit(exit.code().unwrap_or(1));
+        }
+        Command::Db(DbCommand::SampleChanges { out, limit }) => {
+            let db_path = cli.db_path()?;
+            let mut conn = CrConn::init(Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )?)?;
+
+            std::fs::create_dir_all(out)?;
+            let tx = conn.transaction()?;
+
+            let mut version_stmt = tx.prepare(
+                "SELECT DISTINCT site_id, db_version
+                    FROM crsql_changes
+                    ORDER BY ts DESC
+                    LIMIT ?",
+            )?;
+
+            let versions: Vec<(ActorId, CrsqlDbVersion)> = version_stmt
+                .query_map([*limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+
+            let mut written = 0usize;
+            for (actor_id, version) in versions {
+                let (last_seq, ts): (CrsqlSeq, Timestamp) = tx.query_row(
+                    "SELECT MAX(seq), MAX(ts)
+                         FROM crsql_changes
+                         WHERE site_id = ? AND db_version = ?",
+                    (actor_id, version),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+
+                let mut change_stmt = tx.prepare(
+                    r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                           FROM crsql_changes
+                           WHERE site_id = ? AND db_version = ?
+                           ORDER BY seq ASC"#,
+                )?;
+                let rows = change_stmt.query_map((actor_id, version), row_to_change)?;
+                let chunked =
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+
+                for (i, chunk) in chunked.enumerate() {
+                    let (changes, seqs) = chunk?;
+                    let change = ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::FullV2 {
+                            actor_id,
+                            version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        },
+                    };
+                    let encoded = change.write_to_vec()?;
+                    std::fs::write(out.join(format!("{actor_id}_{version}_{i}.bin")), &encoded)?;
+                    written += 1;
+                }
+            }
+
+            info!("wrote {written} change samples to {out}");
+        }
+        Command::Subs(SubsCommand::Info { hash, id }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::Info {
+                hash: hash.clone(),
+                id: *id,
+            }))
+            .await?;
+        }
+        Command::Subs(SubsCommand::List) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::List))
+                .await?;
+        }
+        Command::Log(LogCommand::Set { filter }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Set {
+                filter: filter.clone(),
+            }))
+            .await?;
+        }
+        Command::Log(LogCommand::Reset) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Reset))
+                .await?;
+        }
+        Command::Plumtree(PlumtreeCommand::Stats) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Plumtree(
+                corro_admin::PlumtreeCommand::Stats,
+            ))
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn main() {
+    let cli: Cli = Cli::parse();
+
+    if cli.version_hash {
+        println!("{GIT_SHA}");
+        return;
+    }
+
+    match &cli.command {
+        Some(Command::Version) => {
+            let info = version();
+            println!("{info}");
+            println!("{}", info.compiler);
+            println!("target: {}", info.target);
+            println!("built: {}", info.timestamp);
+            return;
+        }
+        None => Cli::command()
+            .error(ErrorKind::MissingSubcommand, "a subcommand is required")
+            .exit(),
+        _ => {}
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(8)
+        .build()
+        .expect("could not build tokio runtime");
+
+    if let Err(e) = rt.block_on(process_cli(cli)) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+#[derive(Parser)]
+#[command(version = VERSION)]
+struct Cli {
+    /// Set the config file path
+    #[arg(
+        long = "config",
+        short,
+        global = true,
+        default_value = "/etc/corrosion/config.toml"
+    )]
+    config_path: Utf8PathBuf,
+
+    #[arg(long, global = true)]
+    api_addr: Option<SocketAddr>,
+
+    #[arg(long, global = true)]
+    db_path: Option<Utf8PathBuf>,
+
+    #[arg(long, global = true)]
+    admin_path: Option<Utf8PathBuf>,
+
+    /// Print the git commit hash this binary was built from
+    #[arg(long = "version-hash")]
+    version_hash: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+impl Cli {
+    fn api_client(&self) -> Result<CorrosionApiClient, ConfigError> {
+        API_CLIENT
+            .get_or_try_init(|| {
+                // Best-effort read of the bearer token from config. If `--api-addr`
+                // is provided without a usable config file, fall through to an
+                // unauthenticated client rather than failing here.
+                let auth_token = self.config().ok().and_then(|c| {
+                    c.api.authorization.map(|authz| match authz {
+                        AuthzConfig::BearerToken(token) => token,
+                    })
+                });
+                CorrosionApiClient::with_auth_token(self.api_addr()?, auth_token)
+                    .map_err(|err| config::ConfigError::Foreign(Box::new(err)).into())
+            })
+            .cloned()
+    }
+
+    fn api_addr(&self) -> Result<SocketAddr, ConfigError> {
+        Ok(if let Some(api_addr) = self.api_addr {
+            api_addr
+        } else {
+            *self.config()?.api.bind_addr.first().unwrap()
+        })
+    }
+
+    fn db_path(&self) -> Result<Utf8PathBuf, ConfigError> {
+        Ok(if let Some(ref db_path) = self.db_path {
+            db_path.clone()
+        } else {
+            self.config()?.db.path
+        })
+    }
+
+    fn admin_path(&self) -> Utf8PathBuf {
+        if let Some(ref admin_path) = self.admin_path {
+            admin_path.clone()
+        } else if let Ok(config) = Config::load(self.config_path.as_str()) {
+            config.admin.uds_path
+        } else {
+            default_admin_path()
+        }
+    }
+
+    fn config(&self) -> Result<Config, ConfigError> {
+        CONFIG
+            .get_or_try_init(|| {
+                let config_path = &self.config_path;
+                Config::load(config_path.as_str())
+            })
+            .cloned()
+    }
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Launches the agent
+    Agent,
+
+    /// Backup the Corrosion DB
+    Backup { path: String },
+
+    /// Restore the Corrosion DB from a backup
+    Restore {
+        path: Utf8PathBuf,
+        #[arg(long, default_value = "false")]
+        self_actor_id: bool,
+        #[arg(long)]
+        actor_id: Option<Uuid>,
+    },
+
+    /// Cluster interactions
+    #[command(subcommand)]
+    Cluster(ClusterCommand),
+
+    /// Consul interactions
+    #[command(subcommand)]
+    Consul(ConsulCommand),
+
+    /// Query data from Corrosion w/ a SQL statement
+    Query {
+        query: String,
+        #[arg(long, default_value = "false")]
+        columns: bool,
+        #[arg(long, default_value = "false")]
+        timer: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long)]
+        param: Vec<String>,
+    },
+
+    /// Execute a SQL statement that mutates the state of Corrosion
+    Exec {
+        query: String,
+        #[arg(long)]
+        param: Vec<String>,
+        #[arg(long, default_value = "false")]
+        timer: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+
+    /// Reload Corrosion schema
+    Reload,
+
+    /// Rescan gossip.compression.dict_dir and reload zstd dictionaries
+    /// without restarting the agent
+    ReloadDicts,
+
+    /// Sync-related commands
+    #[command(subcommand)]
+    Sync(SyncCommand),
+
+    /// Actor-related commands
+    #[command(subcommand)]
+    Actor(ActorCommand),
+
+    Template {
+        template: Vec<String>,
+        #[command(flatten)]
+        flags: TemplateFlags,
+    },
+
+    /// Tls-related commands
+    #[command(subcommand)]
+    Tls(TlsCommand),
+
+    /// DB-related commands
+    #[command(subcommand)]
+    Db(DbCommand),
+
+    /// Subscription related commands
+    #[command(subcommand)]
+    Subs(SubsCommand),
+
+    /// Log related commands
+    #[command(subcommand)]
+    Log(LogCommand),
+
+    /// Plumtree broadcast overlay commands
+    #[command(subcommand)]
+    Plumtree(PlumtreeCommand),
+
+    /// Print version and build information
+    Version,
+}
+
+#[derive(Subcommand)]
+enum PlumtreeCommand {
+    /// Dump key plumtree overlay stats
+    Stats,
+}
+
+#[derive(Subcommand)]
+enum ClusterCommand {
+    // /// Dumps info about the current actor
+    // Actor,
+    /// Force a rejoin of the cluster
+    Rejoin,
+    /// Dumps the current members
+    Members,
+    /// Dumps the current member SWIM states
+    MembershipStates,
+    /// Set a new cluster ID for the node
+    SetId { cluster_id: u16 },
+}
+
+#[derive(Subcommand)]
+enum ConsulCommand {
+    /// Synchronizes the local consul agent with Corrosion
+    Sync,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    /// Generate a sync message from the current agent
+    Generate,
+    /// Check in-memory bookie state against DB-loaded bookie state
+    CheckBookieConsistency,
+    ReconcileGaps,
+    /// Apply a single fully-buffered (gap-free) version's changes into crsql_changes,
+    /// in smaller batches instead of one large insert
+    ProcessBufferedChanges {
+        actor_id: Uuid,
+        version: u64,
+        /// Number of buffered rows (seqs) to insert per batch
+        #[arg(long, default_value = "1000")]
+        chunk_size: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ActorCommand {
+    /// Get information about a known version
+    Version { actor_id: Uuid, version: u64 },
+}
+
+#[derive(Subcommand)]
+enum TlsCommand {
+    /// TLS certificate authority commands
+    #[command(subcommand)]
+    Ca(TlsCaCommand),
+    /// TLS server certificate commands
+    #[command(subcommand)]
+    Server(TlsServerCommand),
+    /// TLS client certificate commands (for mutual TLS)
+    #[command(subcommand)]
+    Client(TlsClientCommand),
+}
+
+#[derive(Subcommand)]
+enum TlsCaCommand {
+    /// Generate a TLS certificate authority
+    Generate,
+}
+
+#[derive(Subcommand)]
+enum TlsServerCommand {
+    /// Generate a TLS server certificate from a CA
+    Generate {
+        ip: IpAddr,
+        #[arg(long)]
+        ca_key: Utf8PathBuf,
+        #[arg(long)]
+        ca_cert: Utf8PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum TlsClientCommand {
+    /// Generate a TLS certificate from a CA
+    Generate {
+        #[arg(long)]
+        ca_key: Utf8PathBuf,
+        #[arg(long)]
+        ca_cert: Utf8PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Acquires the lock on the DB
+    Lock { cmd: String },
+    /// Write recent changes to disk as speedy-encoded `ChangeV1` samples,
+    /// one file per change chunk (as produced by ChunkedChanges), for training a zstd compression
+    /// dictionary with `db train-dict`
+    SampleChanges {
+        /// Directory to write samples into
+        #[arg(long)]
+        out: Utf8PathBuf,
+        /// How many of the most recent db_versions to sample
+        #[arg(long, default_value = "5000")]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum SubsCommand {
+    /// List all subscriptions on a node
+    List,
+    /// Get information on a subscription
+    Info {
+        #[arg(long)]
+        hash: Option<String>,
+        #[arg(long)]
+        id: Option<Uuid>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    /// Set the log filter
+    Set { filter: String },
+    /// Reset the log filter to default
+    Reset,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vacuum_into;
+    use rusqlite::Connection;
+
+    #[tokio::test]
+    async fn vacuum_into_creates_missing_parent_directories() -> eyre::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let source_path = temp_dir.path().join("source.db");
+        let destination_path = temp_dir.path().join("backups/nested/backup.db");
+
+        let source = Connection::open(&source_path)?;
+        source.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+        source.execute("INSERT INTO test (id) VALUES (1)", [])?;
+        drop(source);
+
+        assert!(!destination_path.parent().unwrap().exists());
+
+        let destination = destination_path.to_string_lossy();
+        vacuum_into(&source_path, &destination).await?;
+
+        let backup = Connection::open(&destination_path)?;
+        let row_count: i64 = backup.query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))?;
+        assert_eq!(row_count, 1);
+
+        Ok(())
+    }
+}

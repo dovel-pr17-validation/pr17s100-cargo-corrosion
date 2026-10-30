@@ -1,0 +1,670 @@
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
+
+use metrics::counter;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use rusqlite::types::{ToSql, ToSqlOutput, Value};
+use rusqlite::{
+    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction, MAIN_DB,
+};
+use sqlite_pool::SqliteConn;
+use std::rc::Rc;
+use tempfile::TempDir;
+use thread_local::ThreadLocal;
+use tracing::{error, info, trace, warn};
+use tripwire::Tripwire;
+
+use crate::vtab::unnest::UnnestTab;
+
+pub type SqlitePool = sqlite_pool::Pool<CrConn>;
+pub type SqlitePoolError = sqlite_pool::PoolError;
+
+// Global registry for query stats
+// (sql, readonly) => (total_count, total_nanos)
+type QueryStats = HashMap<(String, bool), (u64, u128)>;
+type InFlightQueries = HashMap<String, Instant>;
+static QUERY_STATS: ThreadLocal<Mutex<QueryStats>> = ThreadLocal::new();
+pub static IN_FLIGHT_QUERIES: ThreadLocal<Mutex<InFlightQueries>> = ThreadLocal::new();
+
+// Aggregate stats for subscription matcher connections (no per-query breakdown)
+static SUBS_QUERY_STATS: ThreadLocal<Mutex<(u64, u128)>> = ThreadLocal::new(); // (count, nanos)
+
+// Flags for tracking crsql_changes application scope (RW connection only)
+static IN_CHANGES_SCOPE: AtomicBool = AtomicBool::new(false);
+static IN_DATA_MODE: AtomicBool = AtomicBool::new(false);
+
+// Per-thread stats for data vs metadata during crsql_changes application
+static CHANGES_DATA_STATS: ThreadLocal<Mutex<(u64, u128)>> = ThreadLocal::new(); // (count, nanos)
+static CHANGES_META_STATS: ThreadLocal<Mutex<(u64, u128)>> = ThreadLocal::new();
+
+pub async fn query_metrics_loop(mut tripwire: Tripwire) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut prev_tick = interval.tick().await;
+    loop {
+        tokio::select! {
+        t = interval.tick() => {
+            let elapsed = t.duration_since(prev_tick);
+            prev_tick = t;
+            handle_query_metrics(elapsed);
+            handle_subs_query_metrics();
+            handle_changes_metrics();
+            },
+            _ = &mut tripwire => break,
+        }
+    }
+}
+
+// Log to stdout queries taking more than 1 second
+const SLOW_QUERY_THRESHOLD: Duration = Duration::from_secs(1);
+// Send utilization metrics for queries taking more than 10ms per second on average
+const IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND: f64 = 10.0;
+// The default length in prometheus is 4kb but 1kb is more than enough
+const MAX_QUERY_LABEL_LENGTH: usize = 1024;
+fn handle_query_metrics(elapsed: Duration) {
+    // Aggregate and drain stats from all threads into a single map
+    let mut aggregated: QueryStats = Default::default();
+
+    for stats_mutex in QUERY_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        for (key, (count, nanos)) in stats.drain() {
+            let entry = aggregated.entry(key).or_insert((0u64, 0u128));
+            entry.0 += count;
+            entry.1 += nanos;
+        }
+    }
+
+    let mut other_ro_queries_count = 0u64;
+    let mut other_ro_queries_nanos = 0u128;
+    let mut other_rw_queries_count = 0u64;
+    let mut other_rw_queries_nanos = 0u128;
+    for ((query_raw, readonly), (total_query_count, total_query_nanos)) in aggregated.into_iter() {
+        let total_query_ms = (total_query_nanos / 1_000_000) as u64;
+        let ms_per_second = total_query_ms as f64 / elapsed.as_secs_f64();
+        if ms_per_second > IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND {
+            // For too long queries, truncate them to cap the label length
+            // and append a hash to avoid collisions
+            let query = if query_raw.len() > MAX_QUERY_LABEL_LENGTH {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::Hash;
+                use std::hash::Hasher;
+                let mut h = DefaultHasher::new();
+                query_raw.hash(&mut h);
+                format!(
+                    "{}_{:x}",
+                    query_raw.chars().take(1024 - 16 - 1).collect::<String>(),
+                    h.finish()
+                )
+            } else {
+                query_raw.clone()
+            };
+            counter!("corro.db.query.ms", "query" => query.clone() , "readonly" => readonly.to_string()).increment(total_query_ms);
+            counter!("corro.db.query.count", "query" => query.clone(), "readonly" => readonly.to_string()).increment(total_query_count);
+        } else {
+            // For all other queries let's just sum them up
+            if readonly {
+                other_ro_queries_count += total_query_count;
+                other_ro_queries_nanos += total_query_nanos;
+            } else {
+                other_rw_queries_count += total_query_count;
+                other_rw_queries_nanos += total_query_nanos;
+            }
+        }
+    }
+    let other_queries_name = "OTHER";
+    let other_ro_queries_ms = (other_ro_queries_nanos / 1_000_000) as u64;
+    counter!("corro.db.query.ms", "query" => other_queries_name , "readonly" => "true")
+        .increment(other_ro_queries_ms);
+    counter!("corro.db.query.count", "query" => other_queries_name, "readonly" => "true")
+        .increment(other_ro_queries_count);
+    let other_rw_queries_ms = (other_rw_queries_nanos / 1_000_000) as u64;
+    counter!("corro.db.query.ms", "query" => other_queries_name , "readonly" => "false")
+        .increment(other_rw_queries_ms);
+    counter!("corro.db.query.count", "query" => other_queries_name, "readonly" => "false")
+        .increment(other_rw_queries_count);
+}
+
+fn tracing_callback_ro(ev: rusqlite::trace::TraceEvent) {
+    handle_sql_tracing_event(ev, true);
+}
+
+fn tracing_callback_rw(ev: rusqlite::trace::TraceEvent) {
+    handle_sql_tracing_event(ev, false);
+}
+
+fn is_crsql_changes_insert(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains("insert") && lower.contains("crsql_changes")
+}
+
+/// Returns `Some(true)` for `crsql_internal_sync_bit(1)`,
+/// `Some(false)` for `crsql_internal_sync_bit(0)`,
+/// `None` if not a sync_bit call.
+fn sync_bit_value(sql: &str) -> Option<bool> {
+    let lower = sql.to_lowercase();
+    if lower.contains("crsql_internal_sync_bit(1)") {
+        Some(true)
+    } else if lower.contains("crsql_internal_sync_bit(0)") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
+    match ev {
+        rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) => {
+            let dur = duration.as_nanos();
+            let sql = stmt_ref.sql().to_string();
+
+            // Update per-thread stats to avoid contention on hot path
+            let stats_mutex = QUERY_STATS.get_or_default();
+            let mut stats = stats_mutex.lock();
+            let entry = stats
+                .entry((sql.clone(), readonly))
+                .or_insert((0u64, 0u128));
+            entry.0 += 1;
+            entry.1 += dur;
+            drop(stats); // Release lock quickly
+
+            // Classify data vs metadata during crsql_changes application (RW only)
+            if !readonly {
+                if is_crsql_changes_insert(&sql) {
+                    // Outer INSERT statement completes - reset scope.
+                    // Skip counting this statement: its duration includes all substatements.
+                    IN_CHANGES_SCOPE.store(false, Ordering::Relaxed);
+                    IN_DATA_MODE.store(false, Ordering::Relaxed);
+                } else if IN_CHANGES_SCOPE.load(Ordering::Relaxed) {
+                    if sync_bit_value(&sql).is_some() {
+                        // sync_bit calls are always metadata
+                        let meta = CHANGES_META_STATS.get_or_default();
+                        let mut m = meta.lock();
+                        m.0 += 1;
+                        m.1 += dur;
+                    } else if IN_DATA_MODE.load(Ordering::Relaxed) {
+                        let data = CHANGES_DATA_STATS.get_or_default();
+                        let mut d = data.lock();
+                        d.0 += 1;
+                        d.1 += dur;
+                    } else {
+                        let meta = CHANGES_META_STATS.get_or_default();
+                        let mut m = meta.lock();
+                        m.0 += 1;
+                        m.1 += dur;
+                    }
+                }
+            }
+
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.remove(&sql);
+            drop(inflight_queries);
+
+            if duration >= SLOW_QUERY_THRESHOLD {
+                warn!(
+                    "SLOW {} query {duration:?} => {}",
+                    if readonly { "RO" } else { "RW" },
+                    sql
+                );
+            }
+        }
+        rusqlite::trace::TraceEvent::Stmt(_, sql) => {
+            // Track crsql_changes scope and sync_bit mode (RW only)
+            if !readonly {
+                if is_crsql_changes_insert(sql) {
+                    IN_CHANGES_SCOPE.store(true, Ordering::Relaxed);
+                    IN_DATA_MODE.store(false, Ordering::Relaxed);
+                } else if let Some(val) = IN_CHANGES_SCOPE
+                    .load(Ordering::Relaxed)
+                    .then(|| sync_bit_value(sql))
+                    .flatten()
+                {
+                    IN_DATA_MODE.store(val, Ordering::Relaxed);
+                }
+            }
+
+            // skip trigger for subprograms.
+            if sql.starts_with("--") {
+                return;
+            }
+            let start_time = Instant::now();
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.insert(sql.to_string(), start_time);
+        }
+        _ => {}
+    }
+}
+
+pub fn log_slow_inflight_queries() {
+    let mut aggregated = HashMap::new();
+    for queries_mu in IN_FLIGHT_QUERIES.iter() {
+        let inflight_queries = queries_mu.lock().clone();
+        aggregated.extend(inflight_queries.into_iter());
+    }
+    aggregated.iter().for_each(|(sql, start_time)| {
+        let elapsed = start_time.elapsed();
+        if elapsed > SLOW_QUERY_THRESHOLD {
+            warn!("SLOW in-progress query: {sql} - time since start: {elapsed:?}");
+        }
+    });
+}
+
+pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
+    let readonly = conn.is_readonly(MAIN_DB)?;
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE | TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(if readonly {
+            tracing_callback_ro
+        } else {
+            tracing_callback_rw
+        }),
+    );
+    Ok(())
+}
+
+/// Install tracing on a connection used by subscription matchers.
+/// Writes to a separate SUBS_QUERY_STATS so subs sqlite time is
+/// bucketed into `corro.subs.db.query.ms` / `corro.subs.db.query.count`
+/// instead of the general `corro.db.query.*` metrics.
+pub fn trace_heavy_queries_subs(conn: &Connection) -> rusqlite::Result<()> {
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(tracing_callback_subs),
+    );
+    Ok(())
+}
+
+fn tracing_callback_subs(ev: rusqlite::trace::TraceEvent) {
+    if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = ev {
+        let dur = duration.as_nanos();
+        let sql = stmt_ref.sql().to_string();
+
+        let stats_mutex = SUBS_QUERY_STATS.get_or_default();
+        let mut stats = stats_mutex.lock();
+        stats.0 += 1;
+        stats.1 += dur;
+
+        if duration >= SLOW_QUERY_THRESHOLD {
+            drop(stats);
+            warn!("SLOW SUBS query {duration:?} => {sql}");
+        }
+    }
+}
+
+fn handle_subs_query_metrics() {
+    let mut total_count = 0u64;
+    let mut total_nanos = 0u128;
+
+    for stats_mutex in SUBS_QUERY_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        total_count += stats.0;
+        total_nanos += stats.1;
+        *stats = (0, 0);
+    }
+
+    let total_ms = (total_nanos / 1_000_000) as u64;
+    counter!("corro.subs.db.query.ms").increment(total_ms);
+    counter!("corro.subs.db.query.count").increment(total_count);
+}
+
+fn handle_changes_metrics() {
+    let mut data_count = 0u64;
+    let mut data_nanos = 0u128;
+    for stats_mutex in CHANGES_DATA_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        data_count += stats.0;
+        data_nanos += stats.1;
+        *stats = (0, 0);
+    }
+
+    let mut meta_count = 0u64;
+    let mut meta_nanos = 0u128;
+    for stats_mutex in CHANGES_META_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        meta_count += stats.0;
+        meta_nanos += stats.1;
+        *stats = (0, 0);
+    }
+
+    let data_ms = (data_nanos / 1_000_000) as u64;
+    let meta_ms = (meta_nanos / 1_000_000) as u64;
+    counter!("corro.db.crsql_changes.data.ms").increment(data_ms);
+    counter!("corro.db.crsql_changes.data.count").increment(data_count);
+    counter!("corro.db.crsql_changes.metadata.ms").increment(meta_ms);
+    counter!("corro.db.crsql_changes.metadata.count").increment(meta_count);
+}
+
+const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";
+
+#[cfg(target_os = "macos")]
+pub const CRSQL_EXT_FILENAME: &str = "crsqlite.dylib";
+#[cfg(target_os = "linux")]
+pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-aarch64.dylib");
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-aarch64.so");
+
+// TODO: support windows
+
+// need to keep this alive!
+static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
+    let dir = TempDir::new().expect("could not create temp dir!");
+    std::fs::write(dir.path().join(CRSQL_EXT_GENERIC_NAME), CRSQL_EXT)
+        .expect("could not write crsql ext file");
+    dir
+});
+
+pub fn rusqlite_to_crsqlite_write(
+    conn: rusqlite::Connection,
+    cache_size_kib: i64,
+) -> rusqlite::Result<CrConn> {
+    let conn = rusqlite_to_crsqlite(conn)?;
+    conn.execute_batch(&format!(
+        "
+        PRAGMA cache_size = {};
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_spill = FALSE;
+        ",
+        cache_size_kib
+    ))?;
+
+    Ok(conn)
+}
+
+pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    init_cr_conn(&mut conn)?;
+    setup_conn(&conn)?;
+    sqlite_functions::add_to_connection(&conn)?;
+
+    trace_heavy_queries(&conn)?;
+
+    Ok(CrConn(conn))
+}
+
+#[derive(Debug)]
+pub struct CrConn(Connection);
+
+impl CrConn {
+    pub fn init(mut conn: Connection) -> Result<Self, rusqlite::Error> {
+        init_cr_conn(&mut conn)?;
+        Ok(Self(conn))
+    }
+
+    pub fn immediate_transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
+        self.0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+    }
+}
+
+impl SqliteConn for CrConn {
+    fn conn(&self) -> &rusqlite::Connection {
+        &self.0
+    }
+}
+
+impl Deref for CrConn {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CrConn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for CrConn {
+    fn drop(&mut self) {
+        if let Err(e) = self.execute_batch("select crsql_finalize();") {
+            error!("could not crsql_finalize: {e}");
+        }
+    }
+}
+
+fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let ext_dir = &CRSQL_EXT_DIR;
+    trace!(
+        "loading crsqlite extension from path: {}",
+        ext_dir.path().display()
+    );
+    unsafe {
+        trace!("enabled loading extension");
+        conn.load_extension_enable()?;
+        conn.load_extension(
+            ext_dir.path().join(CRSQL_EXT_GENERIC_NAME),
+            Some("sqlite3_crsqlite_init"),
+        )?;
+        conn.load_extension_disable()?;
+    }
+    trace!("loaded crsqlite extension");
+
+    Ok(())
+}
+
+pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
+    conn.execute_batch(
+        r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA journal_size_limit = 1073741824;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA recursive_triggers = ON;
+            PRAGMA mmap_size = 8589934592; -- 8GB
+        "#,
+    )?;
+
+    rusqlite::vtab::series::load_module(conn)?;
+
+    // Register unnest for PostgreSQL-style multi-array unnesting
+    conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+    conn.create_module("corro_unnest", eponymous_only_module::<UnnestTab>(), None)?;
+
+    Ok(())
+}
+
+pub trait Migration {
+    fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()>;
+}
+
+impl<F> Migration for F
+where
+    F: Fn(&Transaction) -> rusqlite::Result<()>,
+{
+    fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()> {
+        self(tx)
+    }
+}
+
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+// Read migration version field from the SQLite db
+pub fn migration_version(tx: &Transaction) -> Option<usize> {
+    #[allow(deprecated)] // To keep compatibility with lower rusqlite versions
+    tx.query_row(
+        "SELECT value FROM __corro_state WHERE key = ?",
+        [SCHEMA_VERSION_KEY],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|v| v as usize)
+    .ok()
+}
+
+// Set user version field from the SQLite db
+pub fn set_migration_version(tx: &Transaction, v: usize) -> rusqlite::Result<usize> {
+    tx.execute(
+        "INSERT OR REPLACE INTO __corro_state VALUES (?, ?)",
+        params![SCHEMA_VERSION_KEY, v],
+    )
+}
+
+// should be a noop if up to date!
+pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> rusqlite::Result<()> {
+    let target_version = migrations.len();
+
+    let tx = conn.transaction()?;
+
+    // determine how many migrations to skip (skip as many as we are at)
+    let skip_n = migration_version(&tx).unwrap_or_default();
+
+    if skip_n > migrations.len() {
+        warn!("Skipping migrations, database is at migration version {skip_n} which is greater than {}", migrations.len());
+        return Ok(());
+    }
+
+    for (i, migration) in migrations.into_iter().skip(skip_n).enumerate() {
+        let new_version = skip_n + i;
+        info!("Applying migration to v{new_version}");
+        let start = Instant::now();
+        migration.migrate(&tx)?;
+        info!("Applied v{new_version} in {:?}", start.elapsed());
+    }
+    set_migration_version(&tx, target_version)?;
+
+    tx.commit()?;
+    Ok(())
+}
+
+// Converts any iterator over something convertible to SQL
+// into a vector of SQL values, which can be used as a parameter
+// to the `unnest` function in SQL.
+// Due to limitations in rusqlite we need to use owned values
+pub fn unnest_param<T, K>(iter: T) -> Rc<Vec<Value>>
+where
+    T: IntoIterator<Item = K>,
+    K: ToSql,
+{
+    Rc::new(
+        iter.into_iter()
+            .map(|to_sql| match to_sql.to_sql() {
+                Ok(ToSqlOutput::Borrowed(v)) => v.into(),
+                Ok(ToSqlOutput::Owned(v)) => v,
+                _ => panic!("Nope"),
+            })
+            .collect::<Vec<Value>>(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::{stream::FuturesUnordered, TryStreamExt};
+    use sqlite_pool::Config;
+    use sqlite_pool::InterruptibleTransaction;
+    use tokio::task::block_in_place;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::TempDir::new()?;
+
+        let pool = sqlite_pool::Config::new(tmpdir.path().join("test.db"))
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)?;
+
+        {
+            let conn = pool.get().await?;
+
+            conn.execute_batch(
+                "
+                CREATE TABLE foo (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
+                SELECT crsql_as_crr('foo');
+            ",
+            )?;
+        }
+
+        let total: i64 = 1000;
+        let per_worker: i64 = 5;
+
+        let futs = FuturesUnordered::from_iter((0..total).map(|_| {
+            let pool = pool.clone();
+            async move {
+                tokio::spawn(async move {
+                    let _: () = FuturesUnordered::from_iter((0..per_worker).map(|_| {
+                        let pool = pool.clone();
+                        async move {
+                            let conn = pool.get().await?;
+                            block_in_place(|| {
+                                conn.prepare_cached(
+                                    "INSERT INTO foo (a, b) VALUES (random(), random())",
+                                )?
+                                .execute(())?;
+                                Ok::<_, TestError>(())
+                            })?;
+                            Ok::<_, TestError>(())
+                        }
+                    }))
+                    .try_collect()
+                    .await?;
+                    Ok::<_, TestError>(())
+                })
+                .await??;
+                Ok::<_, TestError>(())
+            }
+        }));
+
+        let _: () = futs.try_collect().await?;
+
+        let conn = pool.get().await?;
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM foo;", (), |row| row.get(0))?;
+
+        assert_eq!(count, total * per_worker);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_interruptible_transaction() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+
+        let path = tmpdir.path().join("db.sqlite");
+        let pool = Config::new(path)
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)?;
+
+        let mut conn = pool.get().await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS testsbool (
+            id INTEGER NOT NULL PRIMARY KEY,
+            b boolean not null default false
+        ); SELECT crsql_as_crr('testsbool')",
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
+            let res = itx.execute("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;", &[]);
+
+            assert!(res.is_err_and(
+                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+            ));
+        }
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM testsbool;", (), |row| row.get(0))?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum TestError {
+        #[error(transparent)]
+        Rusqlite(#[from] rusqlite::Error),
+        #[error(transparent)]
+        Bb8Rusqlite(#[from] SqlitePoolError),
+        #[error(transparent)]
+        Join(#[from] tokio::task::JoinError),
+    }
+}
